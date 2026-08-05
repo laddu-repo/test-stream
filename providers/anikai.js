@@ -20,6 +20,20 @@ function getSimilarity(a, b) {
     return (2 * common) / (ba.size + bb.size);
 }
 
+function toRoman(num) {
+    const vals = [[10,'X'],[9,'IX'],[5,'V'],[4,'IV'],[1,'I']];
+    let result = '';
+    for (const [v, s] of vals) { while (num >= v) { result += s; num -= v; } }
+    return result;
+}
+
+function isMovieOrSpecial(url) {
+    const u = url.toLowerCase();
+    return u.includes('movie') || u.includes('film') || u.includes('compilation') ||
+           u.includes('special') || u.includes('ova') || u.includes('ona') ||
+           u.includes('recap') || u.includes('summary');
+}
+
 async function imdbToTmdb(imdbId) {
     try {
         const url = `${TMDB_BASE}/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`;
@@ -43,6 +57,15 @@ async function getTmdbMeta(tmdbId, type) {
     } catch (e) { return null; }
 }
 
+async function getSeasonDetails(tmdbId, seasonNum) {
+    try {
+        const url = `${TMDB_BASE}/tv/${tmdbId}/season/${seasonNum}?api_key=${TMDB_API_KEY}`;
+        const res = await fetch(url, { headers: { 'User-Agent': UA } });
+        if (!res.ok) return null;
+        return await res.json();
+    } catch (e) { return null; }
+}
+
 async function searchAnikai(query) {
     try {
         const url = `${ANIKAI_BASE}/browser?keyword=${encodeURIComponent(query)}`;
@@ -60,6 +83,22 @@ async function searchAnikai(query) {
         }
         return results;
     } catch (e) { return []; }
+}
+
+async function getEpisodeCount(animeUrl) {
+    try {
+        const res = await fetch(`${animeUrl}/ep-1`, { headers: { 'User-Agent': UA } });
+        if (!res.ok) return 0;
+        const html = await res.text();
+        const slug = animeUrl.split('/watch/')[1];
+        const epRegex = new RegExp(`/watch/${slug}/ep-(\\d+)`, 'g');
+        let match, maxEp = 0;
+        while ((match = epRegex.exec(html)) !== null) {
+            const ep = parseInt(match[1]);
+            if (ep > maxEp) maxEp = ep;
+        }
+        return maxEp;
+    } catch (e) { return 0; }
 }
 
 function unpackPacked(html) {
@@ -142,8 +181,6 @@ async function getStreamsFromWatchPage(watchUrl) {
                 const embedUrl = vmatch[1];
                 serverIdx++;
                 const serverName = `HD-${serverIdx}`;
-                const fullLabel = `${serverName} (${audioLabel})`;
-
                 const embedStreams = await extractFromEmbed(embedUrl);
                 for (const s of embedStreams) {
                     if (seenUrls.has(s.url)) continue;
@@ -179,27 +216,54 @@ async function extractFromEmbed(embedUrl) {
             else if (match[1].includes('720')) quality = '720p';
             else if (match[1].includes('480')) quality = '480p';
             else if (match[1].includes('360')) quality = '360p';
-            streams.push({
-                url: match[1],
-                quality: quality,
-                headers: { 'Referer': embedUrl, 'User-Agent': UA }
-            });
+            streams.push({ url: match[1], quality, headers: { 'Referer': embedUrl, 'User-Agent': UA } });
         }
 
         if (streams.length === 0 && html.includes('eval(function(p,a,c,k,e,d)')) {
             const unpacked = unpackPacked(html);
             if (unpacked) {
                 while ((match = m3u8Regex.exec(unpacked)) !== null) {
-                    streams.push({
-                        url: match[1],
-                        quality: 'Unknown',
-                        headers: { 'Referer': embedUrl, 'User-Agent': UA }
-                    });
+                    streams.push({ url: match[1], quality: 'Unknown', headers: { 'Referer': embedUrl, 'User-Agent': UA } });
                 }
             }
         }
         return streams;
     } catch (e) { return []; }
+}
+
+async function findBestAnikaiEntry(results, title, season) {
+    // Filter out movies/specials/compilations
+    const filtered = results.filter(r => !isMovieOrSpecial(r.url));
+    if (filtered.length === 0) return results.length > 0 ? results[0] : null;
+
+    // For season 1, prefer entries without roman numeral suffixes
+    // For season >1, prefer entries with the matching roman numeral
+    if (season && season > 1) {
+        const roman = toRoman(season).toLowerCase();
+        const seasonMatch = filtered.find(r => {
+            const slug = r.url.split('/watch/')[1] || '';
+            return slug.toLowerCase().endsWith('-' + roman) ||
+                   slug.toLowerCase().includes('-' + roman + '-') ||
+                   slug.toLowerCase().includes('season-' + season) ||
+                   slug.toLowerCase().includes('s' + season);
+        });
+        if (seasonMatch) return seasonMatch;
+    } else if (!season || season === 1) {
+        // Prefer entries that DON'T end with a roman numeral (season 1)
+        const season1 = filtered.find(r => {
+            const slug = r.url.split('/watch/')[1] || '';
+            return !slug.match(/-(ii|iii|iv|v|vi|vii|viii|ix|x)$/i);
+        });
+        if (season1) return season1;
+    }
+
+    // Fallback: best similarity match
+    let best = null, bestScore = 0;
+    for (const r of filtered) {
+        const score = getSimilarity(r.title, title);
+        if (score > bestScore) { bestScore = score; best = r; }
+    }
+    return best || filtered[0];
 }
 
 async function getStreams(id, type = 'tv', season = null, episode = null) {
@@ -218,19 +282,22 @@ async function getStreams(id, type = 'tv', season = null, episode = null) {
         if (type === 'movie') {
             const results = await searchAnikai(title);
             if (results.length === 0) return [];
-            return await getStreamsFromWatchPage(`${results[0].url}/ep-1`);
+            // For movies, prefer movie entries
+            const movieEntry = results.find(r => isMovieOrSpecial(r.url));
+            const target = movieEntry || results[0];
+            return await getStreamsFromWatchPage(`${target.url}/ep-1`);
         }
 
+        // TV type: determine the correct AniKai entry and episode number
         const seasons = meta.seasons || [];
-        let absoluteEp = episode || 1;
-        if (season && season > 0) {
-            for (const s of seasons) {
-                if (s.season_number < season && s.season_number > 0) {
-                    absoluteEp += s.episode_count;
-                }
-            }
-        }
+        const seasonNum = season || 1;
+        const epNum = episode || 1;
 
+        // Get the season's episode count from TMDB
+        const tmdbSeason = seasons.find(s => s.season_number === seasonNum);
+        const seasonEpCount = tmdbSeason ? tmdbSeason.episode_count : 0;
+
+        // Search AniKai with the series title
         const results = await searchAnikai(title);
         if (results.length === 0) {
             const altResults = await searchAnikai(meta.original_name || title);
@@ -238,15 +305,31 @@ async function getStreams(id, type = 'tv', season = null, episode = null) {
             results.push(...altResults);
         }
 
-        let best = null, bestScore = 0;
-        for (const r of results) {
-            const score = getSimilarity(r.title, title);
-            if (score > bestScore) { bestScore = score; best = r; }
-        }
-        if (!best && results.length > 0) best = results[0];
+        // Find the best entry for this season
+        const best = await findBestAnikaiEntry(results, title, seasonNum);
         if (!best) return [];
 
-        return await getStreamsFromWatchPage(`${best.url}/ep-${absoluteEp}`);
+        // Check how many episodes this AniKai entry has
+        const anikaiEpCount = await getEpisodeCount(best.url);
+
+        let targetEp;
+        if (anikaiEpCount > seasonEpCount && seasonNum > 1) {
+            // This entry contains multiple seasons (like One Piece)
+            // Use absolute episode numbering
+            let absoluteEp = epNum;
+            for (const s of seasons) {
+                if (s.season_number < seasonNum && s.season_number > 0) {
+                    absoluteEp += s.episode_count;
+                }
+            }
+            targetEp = absoluteEp;
+        } else {
+            // This entry is for a single season
+            // Use the episode number directly
+            targetEp = epNum;
+        }
+
+        return await getStreamsFromWatchPage(`${best.url}/ep-${targetEp}`);
     } catch (e) {
         console.error('[AniKai] getStreams error:', e.message);
         return [];
