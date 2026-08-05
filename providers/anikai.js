@@ -20,23 +20,24 @@ function getSimilarity(a, b) {
     return (2 * common) / (ba.size + bb.size);
 }
 
-async function getTmdbMeta(tmdbId, type) {
+async function imdbToTmdb(imdbId, type) {
     try {
-        const url = type === 'movie'
-            ? `${TMDB_BASE}/movie/${tmdbId}?api_key=${TMDB_API_KEY}`
-            : `${TMDB_BASE}/tv/${tmdbId}?api_key=${TMDB_API_KEY}`;
+        const url = `${TMDB_BASE}/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`;
         const res = await fetch(url, { headers: { 'User-Agent': UA } });
         if (!res.ok) return null;
-        return await res.json();
+        const data = await res.json();
+        const results = type === 'movie' ? data.movie_results : data.tv_results;
+        if (results && results.length > 0) return results[0];
+        return null;
     } catch (e) {
-        console.error('[AniKai] TMDB error:', e.message);
+        console.error('[AniKai] imdbToTmdb error:', e.message);
         return null;
     }
 }
 
-async function getSeasonInfo(tmdbId, seasonNum) {
+async function getTmdbMeta(tmdbId) {
     try {
-        const url = `${TMDB_BASE}/tv/${tmdbId}/season/${seasonNum}?api_key=${TMDB_API_KEY}`;
+        const url = `${TMDB_BASE}/tv/${tmdbId}?api_key=${TMDB_API_KEY}`;
         const res = await fetch(url, { headers: { 'User-Agent': UA } });
         if (!res.ok) return null;
         return await res.json();
@@ -52,17 +53,14 @@ async function searchAnikai(query) {
         if (!res.ok) return [];
         const html = await res.text();
         const results = [];
-        const itemRegex = /class="aitem"[\s\S]*?<a[^>]*href="([^"]*)"[\s\S]*?<img[^>]*src="([^"]*)"[^>]*>[\s\S]*?<span[^>]*class="title"[^>]*>([^<]*)<\/span>/g;
+        const itemRegex = /class="aitem"[\s\S]*?href="([^"]*\/watch\/[^"]*)"/g;
         let match;
         while ((match = itemRegex.exec(html)) !== null) {
             let href = match[1];
             if (!href.startsWith('http')) href = ANIKAI_BASE + href;
-            href = href.replace(/\/ep-\d+$/, '');
-            results.push({
-                url: href,
-                poster: match[2],
-                title: match[3].trim()
-            });
+            const titleMatch = html.substring(match.index, match.index + 500).match(/class="title"[^>]*>([^<]*)/);
+            const title = titleMatch ? titleMatch[1].trim() : '';
+            results.push({ url: href, title: title });
         }
         return results;
     } catch (e) {
@@ -71,27 +69,35 @@ async function searchAnikai(query) {
     }
 }
 
-async function getEpisodeList(animeUrl) {
+async function getEpisodeUrl(animeUrl, absoluteEp) {
     try {
-        const res = await fetch(animeUrl, { headers: { 'User-Agent': UA } });
-        if (!res.ok) return [];
+        const epUrl = animeUrl.includes('/ep-') ? animeUrl : `${animeUrl}/ep-1`;
+        const res = await fetch(epUrl, {
+            headers: { 'User-Agent': UA },
+            redirect: 'follow'
+        });
+        if (!res.ok) return null;
         const html = await res.text();
-        const episodes = [];
-        const epRegex = /<a[^>]*href="([^"]*)"[^>]*data-num="(\d+)"[^>]*>[\s\S]*?(?:<span[^>]*data-jp[^>]*>([^<]*)<\/span>)?/g;
-        let match;
-        while ((match = epRegex.exec(html)) !== null) {
-            let epHref = match[1];
-            if (!epHref.startsWith('http')) epHref = ANIKAI_BASE + epHref;
-            episodes.push({
-                url: epHref,
-                number: parseInt(match[2]),
-                title: match[3] ? match[3].trim() : null
-            });
+        const epRegex = new RegExp(`href="([^"]*\/watch\/[^"]*\/ep-${absoluteEp})"`, 'i');
+        const match = html.match(epRegex);
+        if (match) {
+            let url = match[1];
+            if (!url.startsWith('http')) url = ANIKAI_BASE + url;
+            return url;
         }
-        return episodes;
+        const allEps = html.match(/href="([^"]*\/watch\/[^"]*\/ep-\d+)"/g);
+        if (allEps && allEps.length >= absoluteEp) {
+            const targetMatch = allEps[absoluteEp - 1].match(/href="([^"]*)"/);
+            if (targetMatch) {
+                let url = targetMatch[1];
+                if (!url.startsWith('http')) url = ANIKAI_BASE + url;
+                return url;
+            }
+        }
+        return null;
     } catch (e) {
-        console.error('[AniKai] Episode list error:', e.message);
-        return [];
+        console.error('[AniKai] Episode URL error:', e.message);
+        return null;
     }
 }
 
@@ -103,9 +109,7 @@ async function getStreamsFromWatchPage(watchUrl) {
         const streams = [];
         const types = ['sub', 'hsub', 'dub'];
         for (const type of types) {
-            const groupRegex = new RegExp(
-                `data-id="${type}"[\\s\\S]*?<\\/div>`, 'g'
-            );
+            const groupRegex = new RegExp(`data-id="${type}"[\\s\\S]*?</div>`, 'g');
             const groupMatch = html.match(groupRegex);
             if (!groupMatch) continue;
             const groupHtml = groupMatch[0];
@@ -135,7 +139,7 @@ async function extractFromEmbed(embedUrl, label) {
         if (!res.ok) return [];
         const html = await res.text();
         const streams = [];
-        const m3u8Regex = /(https?:\/\/[^\s"']+\.m3u8[^\s"']*)/g;
+        const m3u8Regex = /(https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*)/g;
         let match;
         while ((match = m3u8Regex.exec(html)) !== null) {
             const m3u8Url = match[1];
@@ -149,11 +153,23 @@ async function extractFromEmbed(embedUrl, label) {
                 title: `${label} - ${quality}`,
                 url: m3u8Url,
                 quality: quality,
-                headers: {
-                    'Referer': embedUrl,
-                    'User-Agent': UA
-                }
+                headers: { 'Referer': embedUrl, 'User-Agent': UA }
             });
+        }
+        if (streams.length === 0 && html.includes('eval(function(p,a,c,k,e,d)')) {
+            const unpacked = unpackEval(html);
+            if (unpacked) {
+                while ((match = m3u8Regex.exec(unpacked)) !== null) {
+                    const m3u8Url = match[1];
+                    streams.push({
+                        name: 'AniKai',
+                        title: `${label} - Unknown`,
+                        url: m3u8Url,
+                        quality: 'Unknown',
+                        headers: { 'Referer': embedUrl, 'User-Agent': UA }
+                    });
+                }
+            }
         }
         return streams;
     } catch (e) {
@@ -161,26 +177,111 @@ async function extractFromEmbed(embedUrl, label) {
     }
 }
 
-async function getStreams(tmdbId, type = 'tv', season = null, episode = null) {
+function unpackEval(html) {
     try {
+        const startIdx = html.indexOf('eval(function(p,a,c,k,e,d)');
+        if (startIdx === -1) return null;
+        const openBrace = html.indexOf('{', startIdx);
+        if (openBrace === -1) return null;
+        let braceCount = 1, j = openBrace + 1;
+        while (j < html.length && braceCount > 0) {
+            if (html[j] === '{') braceCount++;
+            else if (html[j] === '}') braceCount--;
+            j++;
+        }
+        const argsStart = html.indexOf('(', j - 1);
+        if (argsStart === -1) return null;
+        let parenCount = 1, k = argsStart + 1;
+        while (k < html.length && parenCount > 0) {
+            if (html[k] === '(') parenCount++;
+            else if (html[k] === ')') parenCount--;
+            k++;
+        }
+        const argsStr = html.substring(argsStart + 1, k - 1).trim();
+        const startChar = argsStr[0];
+        let payload = '', i = 1;
+        while (i < argsStr.length) {
+            if (argsStr[i] === startChar) {
+                let bs = 0, m = i - 1;
+                while (m >= 0 && argsStr[m] === '\\') { bs++; m--; }
+                if (bs % 2 === 0) break;
+            }
+            payload += argsStr[i];
+            i++;
+        }
+        payload = payload.replace(new RegExp('\\\\' + startChar, 'g'), startChar).replace(/\\\\/g, '\\');
+        const rest = argsStr.substring(i + 1);
+        const quoteMatch = rest.match(/["']/);
+        if (!quoteMatch) return null;
+        const quotePos = quoteMatch.index;
+        const quoteChar = quoteMatch.value;
+        const ints = rest.substring(0, quotePos).match(/\b\d+\b/g);
+        if (!ints || ints.length < 2) return null;
+        const a = parseInt(ints[0]), c = parseInt(ints[1]);
+        let keysStr = '', jj = quotePos + 1;
+        while (jj < rest.length) {
+            if (rest[jj] === quoteChar) {
+                let bs = 0, m = jj - 1;
+                while (m >= 0 && rest[m] === '\\') { bs++; m--; }
+                if (bs % 2 === 0) break;
+            }
+            keysStr += rest[jj];
+            jj++;
+        }
+        keysStr = keysStr.replace(new RegExp('\\\\' + quoteChar, 'g'), quoteChar).replace(/\\\\/g, '\\');
+        const keys = keysStr.split('|');
+        const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+        let result = payload;
+        for (let idx = c - 1; idx >= 0; idx--) {
+            if (idx < keys.length && keys[idx]) {
+                let baseStr = '';
+                if (idx === 0) baseStr = '0';
+                else {
+                    let temp = idx;
+                    while (temp > 0) { baseStr = chars[temp % a] + baseStr; temp = Math.floor(temp / a); }
+                }
+                result = result.replace(new RegExp('\\b' + baseStr + '\\b', 'g'), keys[idx]);
+            }
+        }
+        return result;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function getStreams(id, type = 'tv', season = null, episode = null) {
+    try {
+        let tmdbId = id;
+        let meta = null;
+        if (typeof id === 'string' && id.startsWith('tt')) {
+            const tmdbData = await imdbToTmdb(id, type);
+            if (tmdbData) {
+                tmdbId = tmdbData.id;
+                meta = tmdbData;
+            } else {
+                console.error('[AniKai] Could not convert IMDB ID to TMDB ID');
+                return [];
+            }
+        }
         if (type === 'movie') {
-            const meta = await getTmdbMeta(tmdbId, 'movie');
-            if (!meta) return [];
-            const title = meta.title || meta.name;
+            if (!meta) {
+                const res = await fetch(`${TMDB_BASE}/movie/${tmdbId}?api_key=${TMDB_API_KEY}`, { headers: { 'User-Agent': UA } });
+                if (res.ok) meta = await res.json();
+            }
+            const title = meta ? (meta.title || meta.name) : '';
+            if (!title) return [];
             const results = await searchAnikai(title);
             if (results.length === 0) return [];
             const best = results[0];
-            const episodes = await getEpisodeList(best.url);
-            if (episodes.length === 0) return [];
-            const ep = episodes[0];
-            return await getStreamsFromWatchPage(ep.url);
+            const epUrl = await getEpisodeUrl(best.url, 1);
+            if (!epUrl) return [];
+            return await getStreamsFromWatchPage(epUrl);
         }
-
-        const meta = await getTmdbMeta(tmdbId, 'tv');
+        if (!meta) meta = await getTmdbMeta(tmdbId);
         if (!meta) return [];
         const title = meta.name || meta.title;
         const seasons = meta.seasons || [];
-        let absoluteEp = episode;
+        let absoluteEp = episode || 1;
         if (season && season > 0) {
             for (const s of seasons) {
                 if (s.season_number < season && s.season_number > 0) {
@@ -191,29 +292,21 @@ async function getStreams(tmdbId, type = 'tv', season = null, episode = null) {
         console.log(`[AniKai] ${title} S${season}E${episode} = absolute ep ${absoluteEp}`);
         const results = await searchAnikai(title);
         if (results.length === 0) {
-            const altTitle = meta.original_name || meta.name;
+            const altTitle = meta.original_name || title;
             const altResults = await searchAnikai(altTitle);
             if (altResults.length === 0) return [];
             results.push(...altResults);
         }
-        let best = null;
-        let bestScore = 0;
+        let best = null, bestScore = 0;
         for (const r of results) {
             const score = getSimilarity(r.title, title);
-            if (score > bestScore) {
-                bestScore = score;
-                best = r;
-            }
+            if (score > bestScore) { bestScore = score; best = r; }
         }
         if (!best && results.length > 0) best = results[0];
         if (!best) return [];
-        const episodes = await getEpisodeList(best.url);
-        if (episodes.length === 0) return [];
-        const targetEp = episodes.find(e => e.number === absoluteEp) ||
-                         episodes.find(e => e.number === episode) ||
-                         episodes[Math.min(absoluteEp - 1, episodes.length - 1)];
-        if (!targetEp) return [];
-        return await getStreamsFromWatchPage(targetEp.url);
+        const epUrl = await getEpisodeUrl(best.url, absoluteEp);
+        if (!epUrl) return [];
+        return await getStreamsFromWatchPage(epUrl);
     } catch (e) {
         console.error('[AniKai] getStreams error:', e.message);
         return [];
