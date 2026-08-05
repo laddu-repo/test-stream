@@ -27,11 +27,26 @@ function toRoman(num) {
     return result;
 }
 
-function isMovieOrSpecial(url) {
+function isMovieOrSpecial(url, type) {
     const u = url.toLowerCase();
-    return u.includes('movie') || u.includes('film') || u.includes('compilation') ||
-           u.includes('special') || u.includes('ova') || u.includes('ona') ||
-           u.includes('recap') || u.includes('summary');
+    // URL-based keywords (high-confidence special/movie indicators)
+    if (u.includes('movie') || u.includes('film') || u.includes('compilation') ||
+        u.includes('special') || u.includes('ova') || u.includes('ona') ||
+        u.includes('recap') || u.includes('summary') || u.includes('mini') ||
+        u.includes('reigen') || u.includes('spinoff') || u.includes('side-story') ||
+        u.includes('-sp-') || u.endsWith('-sp') ||
+        u.endsWith('-ova') || u.endsWith('-ona') || u.endsWith('-special') ||
+        u.endsWith('-movie') || u.endsWith('-film')) {
+        return true;
+    }
+    // Type-based (parsed from AniKai's HTML type label)
+    // NOTE: We do NOT filter type==='special' because AniKai sometimes
+    // mislabels main TV series (e.g. Chainsaw Man) as 'Special'.
+    // We only filter Movie/OVA/Music/TV_SHORT types which are clearly not TV series.
+    if (type && (type === 'movie' || type === 'ova' || type === 'music' || type === 'tvshort')) {
+        return true;
+    }
+    return false;
 }
 
 async function imdbToTmdb(imdbId) {
@@ -73,13 +88,27 @@ async function searchAnikai(query) {
         if (!res.ok) return [];
         const html = await res.text();
         const results = [];
-        const itemRegex = /class="aitem"[\s\S]*?href="([^"]*\/watch\/[^"]*)"/g;
-        let match;
-        while ((match = itemRegex.exec(html)) !== null) {
-            let href = match[1];
+        // Split by aitem blocks so we can extract title + type for each entry
+        // without bleeding into the next entry.
+        const parts = html.split('class="aitem"');
+        for (let i = 1; i < parts.length; i++) {
+            // Limit to first 2500 chars to avoid capturing the next aitem block
+            const block = parts[i].substring(0, 2500);
+            const hrefMatch = block.match(/href="([^"]*\/watch\/[^"]*)"/);
+            if (!hrefMatch) continue;
+            let href = hrefMatch[1];
             if (!href.startsWith('http')) href = ANIKAI_BASE + href;
-            const titleMatch = html.substring(match.index, match.index + 500).match(/class="title"[^>]*>([^<]*)/);
-            results.push({ url: href, title: titleMatch ? titleMatch[1].trim() : '' });
+            const titleMatch = block.match(/class="title[^"]*"[^>]*>([^<]*)/);
+            const title = titleMatch ? titleMatch[1].trim() : '';
+            // Extract type label: the LAST <span><b>X</b></span> inside .info
+            // Structure: <span class="sub">N</span> <span class="dub">N</span>
+            //            <span><b>N</b></span> (episode count, optional)
+            //            <span><b>TYPE</b></span> (TV / Movie / Special / OVA / ONA)
+            const spanMatches = [...block.matchAll(/<span>\s*<b>\s*([^<]+?)\s*<\/b>\s*<\/span>/g)];
+            const type = spanMatches.length > 0
+                ? spanMatches[spanMatches.length - 1][1].trim().toLowerCase()
+                : '';
+            results.push({ url: href, title, type });
         }
         return results;
     } catch (e) { return []; }
@@ -185,8 +214,10 @@ async function getStreamsFromWatchPage(watchUrl) {
                 for (const s of embedStreams) {
                     if (seenUrls.has(s.url)) continue;
                     seenUrls.add(s.url);
+                    // Put the (Sub)/(Dub) label in BOTH `name` and `title` so the
+                    // label is always visible regardless of which field the UI shows.
                     streams.push({
-                        name: 'AniKai',
+                        name: `AniKai ${serverName} (${audioLabel})`,
                         title: `${serverName} (${audioLabel})`,
                         url: s.url,
                         quality: s.quality,
@@ -232,12 +263,52 @@ async function extractFromEmbed(embedUrl) {
 }
 
 async function findBestAnikaiEntry(results, title, season) {
-    // Filter out movies/specials/compilations
-    const filtered = results.filter(r => !isMovieOrSpecial(r.url));
-    if (filtered.length === 0) return results.length > 0 ? results[0] : null;
+    if (!results || results.length === 0) return null;
 
-    // For season 1, prefer entries without roman numeral suffixes
-    // For season >1, prefer entries with the matching roman numeral
+    // ===== Season 0 (Specials) =====
+    // Look for entries that ARE specials/movies (reverse of the usual filter).
+    if (season === 0) {
+        const specials = results.filter(r => isMovieOrSpecial(r.url, r.type));
+        if (specials.length > 0) {
+            // Pick the one with the highest title similarity to the series name
+            let best = null, bestScore = -1;
+            for (const r of specials) {
+                const score = getSimilarity(r.title, title);
+                if (score > bestScore) { bestScore = score; best = r; }
+            }
+            return best || specials[0];
+        }
+        // No specials found — fall through and pick the first result
+        return results[0];
+    }
+
+    // ===== Seasons 1+ =====
+    // Filter out movies/specials/compilations using both URL keywords AND the
+    // type label parsed from AniKai's HTML.
+    const filtered = results.filter(r => !isMovieOrSpecial(r.url, r.type));
+    if (filtered.length === 0) return results[0];
+
+    const titleLower = (title || '').toLowerCase().trim();
+
+    // For season 1: prefer exact title match first, then non-roman-numeral entries
+    if (!season || season === 1) {
+        // 1a. Exact title match (case-insensitive) — picks e.g. "Mob Psycho 100"
+        //     over "Mob Psycho Mini" which is a spinoff special.
+        const exactMatch = filtered.find(r =>
+            (r.title || '').toLowerCase().trim() === titleLower
+        );
+        if (exactMatch) return exactMatch;
+
+        // 1b. Entries whose URL slug does NOT end with a roman numeral suffix.
+        //     This avoids picking Season 2/3 entries for Season 1.
+        const season1 = filtered.find(r => {
+            const slug = r.url.split('/watch/')[1] || '';
+            return !slug.match(/-(ii|iii|iv|v|vi|vii|viii|ix|x)$/i);
+        });
+        if (season1) return season1;
+    }
+
+    // For season >1: prefer entries whose slug ends with the roman numeral
     if (season && season > 1) {
         const roman = toRoman(season).toLowerCase();
         const seasonMatch = filtered.find(r => {
@@ -248,13 +319,6 @@ async function findBestAnikaiEntry(results, title, season) {
                    slug.toLowerCase().includes('s' + season);
         });
         if (seasonMatch) return seasonMatch;
-    } else if (!season || season === 1) {
-        // Prefer entries that DON'T end with a roman numeral (season 1)
-        const season1 = filtered.find(r => {
-            const slug = r.url.split('/watch/')[1] || '';
-            return !slug.match(/-(ii|iii|iv|v|vi|vii|viii|ix|x)$/i);
-        });
-        if (season1) return season1;
     }
 
     // Fallback: best similarity match
@@ -283,14 +347,15 @@ async function getStreams(id, type = 'tv', season = null, episode = null) {
             const results = await searchAnikai(title);
             if (results.length === 0) return [];
             // For movies, prefer movie entries
-            const movieEntry = results.find(r => isMovieOrSpecial(r.url));
+            const movieEntry = results.find(r => isMovieOrSpecial(r.url, r.type));
             const target = movieEntry || results[0];
             return await getStreamsFromWatchPage(`${target.url}/ep-1`);
         }
 
         // TV type: determine the correct AniKai entry and episode number
         const seasons = meta.seasons || [];
-        const seasonNum = season || 1;
+        // Preserve season 0 (Specials) — don't coerce falsy 0 to 1.
+        const seasonNum = (season === null || season === undefined) ? 1 : season;
         const epNum = episode || 1;
 
         // Get the season's episode count from TMDB
