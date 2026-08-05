@@ -20,14 +20,14 @@ function getSimilarity(a, b) {
     return (2 * common) / (ba.size + bb.size);
 }
 
-async function imdbToTmdb(imdbId, type) {
+async function imdbToTmdb(imdbId) {
     try {
         const url = `${TMDB_BASE}/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`;
         const res = await fetch(url, { headers: { 'User-Agent': UA } });
         if (!res.ok) return null;
         const data = await res.json();
-        const results = type === 'movie' ? data.movie_results : data.tv_results;
-        if (results && results.length > 0) return results[0];
+        if (data.tv_results && data.tv_results.length > 0) return data.tv_results[0];
+        if (data.movie_results && data.movie_results.length > 0) return data.movie_results[0];
         return null;
     } catch (e) {
         console.error('[AniKai] imdbToTmdb error:', e.message);
@@ -35,9 +35,11 @@ async function imdbToTmdb(imdbId, type) {
     }
 }
 
-async function getTmdbMeta(tmdbId) {
+async function getTmdbMeta(tmdbId, type) {
     try {
-        const url = `${TMDB_BASE}/tv/${tmdbId}?api_key=${TMDB_API_KEY}`;
+        const url = type === 'movie'
+            ? `${TMDB_BASE}/movie/${tmdbId}?api_key=${TMDB_API_KEY}`
+            : `${TMDB_BASE}/tv/${tmdbId}?api_key=${TMDB_API_KEY}`;
         const res = await fetch(url, { headers: { 'User-Agent': UA } });
         if (!res.ok) return null;
         return await res.json();
@@ -71,30 +73,19 @@ async function searchAnikai(query) {
 
 async function getEpisodeUrl(animeUrl, absoluteEp) {
     try {
-        const epUrl = animeUrl.includes('/ep-') ? animeUrl : `${animeUrl}/ep-1`;
-        const res = await fetch(epUrl, {
-            headers: { 'User-Agent': UA },
-            redirect: 'follow'
-        });
+        const epUrl = `${animeUrl}/ep-1`;
+        const res = await fetch(epUrl, { headers: { 'User-Agent': UA }, redirect: 'follow' });
         if (!res.ok) return null;
         const html = await res.text();
-        const epRegex = new RegExp(`href="([^"]*\/watch\/[^"]*\/ep-${absoluteEp})"`, 'i');
+        const targetUrl = `${animeUrl}/ep-${absoluteEp}`;
+        const epRegex = new RegExp(`href="([^"]*\\/watch\\/[^"]*\\/ep-${absoluteEp})"`, 'i');
         const match = html.match(epRegex);
         if (match) {
             let url = match[1];
             if (!url.startsWith('http')) url = ANIKAI_BASE + url;
             return url;
         }
-        const allEps = html.match(/href="([^"]*\/watch\/[^"]*\/ep-\d+)"/g);
-        if (allEps && allEps.length >= absoluteEp) {
-            const targetMatch = allEps[absoluteEp - 1].match(/href="([^"]*)"/);
-            if (targetMatch) {
-                let url = targetMatch[1];
-                if (!url.startsWith('http')) url = ANIKAI_BASE + url;
-                return url;
-            }
-        }
-        return null;
+        return animeUrl.includes('/ep-') ? animeUrl : `${animeUrl}/ep-${absoluteEp}`;
     } catch (e) {
         console.error('[AniKai] Episode URL error:', e.message);
         return null;
@@ -107,23 +98,44 @@ async function getStreamsFromWatchPage(watchUrl) {
         if (!res.ok) return [];
         const html = await res.text();
         const streams = [];
-        const types = ['sub', 'hsub', 'dub'];
+        
+        // Split HTML by data-id groups (hsub, sub, dub)
+        const types = ['hsub', 'sub', 'dub'];
         for (const type of types) {
-            const groupRegex = new RegExp(`data-id="${type}"[\\s\\S]*?</div>`, 'g');
-            const groupMatch = html.match(groupRegex);
-            if (!groupMatch) continue;
-            const groupHtml = groupMatch[0];
-            const serverRegex = /<span[^>]*class="server-video"[^>]*data-video="([^"]*)"[^>]*>([^<]*)<\/span>/g;
-            let smatch;
-            while ((smatch = serverRegex.exec(groupHtml)) !== null) {
-                const embedUrl = smatch[1];
-                const serverName = smatch[2].trim();
+            // Find the section for this type
+            const sectionStart = html.indexOf(`data-id="${type}"`);
+            if (sectionStart === -1) continue;
+            
+            // Find the next data-id or end of the server group (closing div)
+            let sectionEnd = html.length;
+            for (const otherType of ['hsub', 'sub', 'dub', 'signin', 'report']) {
+                if (otherType === type) continue;
+                const otherIdx = html.indexOf(`data-id="${otherType}"`, sectionStart + 10);
+                if (otherIdx !== -1 && otherIdx < sectionEnd) {
+                    sectionEnd = otherIdx;
+                }
+            }
+            
+            const sectionHtml = html.substring(sectionStart, sectionEnd);
+            
+            // Extract all data-video URLs from this section
+            const videoRegex = /data-video="([^"]*)"/g;
+            let vmatch;
+            let serverIdx = 0;
+            while ((vmatch = videoRegex.exec(sectionHtml)) !== null) {
+                const embedUrl = vmatch[1];
+                serverIdx++;
+                const serverName = `HD-${serverIdx}`;
                 const isDub = type === 'dub';
                 const label = `${serverName} (${isDub ? 'Dub' : 'Sub'})`;
+                
+                console.log(`[AniKai] Found embed: ${label} -> ${embedUrl.substring(0, 60)}`);
                 const embedStreams = await extractFromEmbed(embedUrl, label);
                 streams.push(...embedStreams);
             }
         }
+        
+        console.log(`[AniKai] Total streams found: ${streams.length}`);
         return streams;
     } catch (e) {
         console.error('[AniKai] Watch page error:', e.message);
@@ -139,6 +151,8 @@ async function extractFromEmbed(embedUrl, label) {
         if (!res.ok) return [];
         const html = await res.text();
         const streams = [];
+        
+        // Direct m3u8 URLs
         const m3u8Regex = /(https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*)/g;
         let match;
         while ((match = m3u8Regex.exec(html)) !== null) {
@@ -156,21 +170,23 @@ async function extractFromEmbed(embedUrl, label) {
                 headers: { 'Referer': embedUrl, 'User-Agent': UA }
             });
         }
+        
+        // If no direct m3u8, try unpacking eval JS
         if (streams.length === 0 && html.includes('eval(function(p,a,c,k,e,d)')) {
             const unpacked = unpackEval(html);
             if (unpacked) {
                 while ((match = m3u8Regex.exec(unpacked)) !== null) {
-                    const m3u8Url = match[1];
                     streams.push({
                         name: 'AniKai',
                         title: `${label} - Unknown`,
-                        url: m3u8Url,
+                        url: match[1],
                         quality: 'Unknown',
                         headers: { 'Referer': embedUrl, 'User-Agent': UA }
                     });
                 }
             }
         }
+        
         return streams;
     } catch (e) {
         return [];
@@ -253,33 +269,39 @@ async function getStreams(id, type = 'tv', season = null, episode = null) {
     try {
         let tmdbId = id;
         let meta = null;
+        
+        // Convert IMDB ID to TMDB ID if needed
         if (typeof id === 'string' && id.startsWith('tt')) {
-            const tmdbData = await imdbToTmdb(id, type);
+            console.log(`[AniKai] Converting IMDB ID: ${id}`);
+            const tmdbData = await imdbToTmdb(id);
             if (tmdbData) {
                 tmdbId = tmdbData.id;
-                meta = tmdbData;
+                console.log(`[AniKai] TMDB ID: ${tmdbId}`);
             } else {
                 console.error('[AniKai] Could not convert IMDB ID to TMDB ID');
                 return [];
             }
         }
+        
+        // Get full metadata (with seasons) from TMDB
+        meta = await getTmdbMeta(tmdbId, type);
+        if (!meta) {
+            console.error('[AniKai] Could not get TMDB metadata');
+            return [];
+        }
+        
+        const title = meta.name || meta.title;
+        console.log(`[AniKai] Title: ${title}`);
+        
         if (type === 'movie') {
-            if (!meta) {
-                const res = await fetch(`${TMDB_BASE}/movie/${tmdbId}?api_key=${TMDB_API_KEY}`, { headers: { 'User-Agent': UA } });
-                if (res.ok) meta = await res.json();
-            }
-            const title = meta ? (meta.title || meta.name) : '';
-            if (!title) return [];
             const results = await searchAnikai(title);
             if (results.length === 0) return [];
-            const best = results[0];
-            const epUrl = await getEpisodeUrl(best.url, 1);
+            const epUrl = await getEpisodeUrl(results[0].url, 1);
             if (!epUrl) return [];
             return await getStreamsFromWatchPage(epUrl);
         }
-        if (!meta) meta = await getTmdbMeta(tmdbId);
-        if (!meta) return [];
-        const title = meta.name || meta.title;
+        
+        // Calculate absolute episode number from TMDB seasons
         const seasons = meta.seasons || [];
         let absoluteEp = episode || 1;
         if (season && season > 0) {
@@ -290,13 +312,20 @@ async function getStreams(id, type = 'tv', season = null, episode = null) {
             }
         }
         console.log(`[AniKai] ${title} S${season}E${episode} = absolute ep ${absoluteEp}`);
+        
+        // Search AniKai
         const results = await searchAnikai(title);
         if (results.length === 0) {
             const altTitle = meta.original_name || title;
             const altResults = await searchAnikai(altTitle);
-            if (altResults.length === 0) return [];
+            if (altResults.length === 0) {
+                console.error('[AniKai] No search results');
+                return [];
+            }
             results.push(...altResults);
         }
+        
+        // Find best match
         let best = null, bestScore = 0;
         for (const r of results) {
             const score = getSimilarity(r.title, title);
@@ -304,8 +333,15 @@ async function getStreams(id, type = 'tv', season = null, episode = null) {
         }
         if (!best && results.length > 0) best = results[0];
         if (!best) return [];
+        
+        console.log(`[AniKai] Best match: ${best.title} (${bestScore}) -> ${best.url}`);
+        
+        // Get episode URL
         const epUrl = await getEpisodeUrl(best.url, absoluteEp);
         if (!epUrl) return [];
+        console.log(`[AniKai] Episode URL: ${epUrl}`);
+        
+        // Get streams from watch page
         return await getStreamsFromWatchPage(epUrl);
     } catch (e) {
         console.error('[AniKai] getStreams error:', e.message);
